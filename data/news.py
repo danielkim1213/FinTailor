@@ -21,6 +21,9 @@ def _finnhub(path: str, **params):
     return http_get(f"{FINNHUB}/{path}", params={**params, "token": tok}, limiter=_lim).json()
 
 
+STALE_AFTER = pd.Timedelta(days=3)  # older than this when first seen -> we missed it live; flag as backfilled
+
+
 def _rows_from_finnhub(items: list[dict], ticker: str | None, backfill: bool) -> list[dict]:
     now = utcnow()
     out = []
@@ -28,13 +31,15 @@ def _rows_from_finnhub(items: list[dict], ticker: str | None, backfill: bool) ->
         pub = pd.to_datetime(it.get("datetime"), unit="s", errors="coerce")
         if pd.isna(pub) or not it.get("headline"):
             continue
+        # gap-fill after downtime: don't stamp week-old articles as "received today" (would shift labels)
+        backfilled = backfill or (now - pub) > STALE_AFTER
         out.append(dict(
             id=f"fh_{it.get('id') or stable_id(it.get('headline'), pub)}",
             ticker=ticker, category=it.get("category"), headline=it["headline"][:500],
             summary=(it.get("summary") or "")[:2000], source=it.get("source"), url=it.get("url"),
             published_at=pub.to_pydatetime(),
-            received_at=(pub + pd.Timedelta(minutes=15)).to_pydatetime() if backfill else now,
-            backfilled=backfill))
+            received_at=(pub + pd.Timedelta(minutes=15)).to_pydatetime() if backfilled else now,
+            backfilled=backfilled))
     return out
 
 
@@ -58,8 +63,8 @@ def collect_finnhub(days: int = 2, tickers: list[str] | None = None, backfill: b
         if "not set" in str(e):
             return 0
     for i, t in enumerate(tickers):
-        # Finnhub caps results per call; walk in month chunks for backfills
-        step = 30 if backfill else days + 1
+        # Finnhub caps results per call; walk in month chunks for backfills / long gaps
+        step = 30 if backfill or days > 30 else days + 1
         s = frm
         while s <= to:
             e = min(s + timedelta(days=step), to)
@@ -69,7 +74,7 @@ def collect_finnhub(days: int = 2, tickers: list[str] | None = None, backfill: b
             except Exception as ex:  # noqa: BLE001
                 log.warning("finnhub %s: %s", t, ex)
             s = e + timedelta(days=1)
-        if i % 50 == 0:
+        if i % 5 == 0:
             log.info("finnhub news: %d/%d tickers, %d items", i, len(tickers), len(rows))
     df = pd.DataFrame(rows).drop_duplicates("id") if rows else pd.DataFrame()
     with connect() as con:
@@ -107,7 +112,21 @@ def collect_rss() -> int:
     return n
 
 
+def days_since_last_fetch(overlap_days: int = 1, default: int = 3) -> int:
+    """Window that covers everything since the newest Finnhub ticker article we hold (+overlap for
+    late-added articles), capped at the free-tier history. Derived from the data itself, so a run that
+    crashed before saving simply gets retried from the same point next time."""
+    cap = get_config()["news"]["backfill_days"]
+    with connect(read_only=True) as con:
+        last = con.execute("select max(published_at) from news where id like 'fh_%' and ticker is not null").fetchone()[0]
+    if last is None:
+        return default
+    gap = (utcnow().date() - pd.Timestamp(last).date()).days
+    return int(min(max(gap + overlap_days, 1), cap))
+
+
 def collect_news(backfill: bool = False) -> int:
-    days = get_config()["news"]["backfill_days"] if backfill else 3
+    days = get_config()["news"]["backfill_days"] if backfill else days_since_last_fetch()
+    log.info("finnhub news window: %d days%s", days, " (backfill)" if backfill else "")
     n = collect_finnhub(days=days, backfill=backfill)
     return n + collect_rss()
