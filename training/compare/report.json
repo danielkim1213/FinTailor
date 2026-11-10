@@ -1,0 +1,73 @@
+{
+ "n": 48,
+ "summary": [
+  {
+   "model": "nvidia/nemotron-3.5-super-vl:free",
+   "batches": 6,
+   "first_try_ok": "6/6",
+   "final_ok": "6/6",
+   "fallback_items": 0,
+   "calls": 6,
+   "tok_in": 4716,
+   "tok_out": 4224,
+   "cost_usd": 0.0,
+   "cost_per_1k_headlines": 0.0,
+   "avg_latency_s": 5.8,
+   "json_mode": true,
+   "errors": [],
+   "sentiment_mean": -0.054,
+   "sentiment_zero_share": 0.48,
+   "event_types": 12,
+   "confidence_mean": 0.67
+  },
+  {
+   "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+   "batches": 6,
+   "first_try_ok": "6/6",
+   "final_ok": "6/6",
+   "fallback_items": 0,
+   "calls": 6,
+   "tok_in": 4716,
+   "tok_out": 4367,
+   "cost_usd": 0.0,
+   "cost_per_1k_headlines": 0.0,
+   "avg_latency_s": 8.5,
+   "json_mode": true,
+   "errors": [],
+   "sentiment_mean": -0.058,
+   "sentiment_zero_share": 0.35,
+   "event_types": 13,
+   "confidence_mean": 0.75
+  },
+  {
+   "model": "google/gemma-4-31b-it:free",
+   "batches": 6,
+   "first_try_ok": "0/6",
+   "final_ok": "0/6",
+   "fallback_items": 48,
+   "calls": 0,
+   "tok_in": 0,
+   "tok_out": 0,
+   "cost_usd": 0.0,
+   "cost_per_1k_headlines": 0.0,
+   "avg_latency_s": null,
+   "json_mode": true,
+   "errors": [
+    "google/gemma-4-31b-it:free: still rate-limited after backoff",
+    "google/gemma-4-31b-it:free: still rate-limited after backoff"
+   ]
+  }
+ ],
+ "agreement": {
+  "nemotron-3.5-super-vl:free vs nemotron-3-ultra-550b-a55b:free": {
+   "n": 48,
+   "sentiment_sign": 0.88,
+   "sentiment_corr": 0.93,
+   "event_type": 0.75,
+   "severity_within_1": 1.0,
+   "horizon": 0.5
+  },
+  "nemotron-3.5-super-vl:free vs gemma-4-31b-it:free": {},
+  "nemotron-3-ultra-550b-a55b:free vs gemma-4-31b-it:free": {}
+ }
+}

@@ -1,0 +1,362 @@
+# FinTailor configuration. Secrets live in .env (see .env.example), never here.
+
+[paths]
+store = "store"                     # DuckDB, parquet panel, models, reports
+
+[universe]
+start_date = "2014-01-01"           # price history start (features need ~1y warmup)
+benchmark = "SPY"
+min_price = 5.0                     # raw close filter
+min_dollar_volume = 3000000        # 20d avg $ volume filter
+megacap_top_n = 50                  # "mega cap" proxy = top-N by 20d $ volume (tier 5-7 universe)
+sector_corr_window = 126            # point-in-time sector assignment window (days)
+
+[universe.sector_etfs]
+XLK = "technology"
+XLF = "financials"
+XLV = "health_care"
+XLY = "consumer_discretionary"
+XLP = "consumer_staples"
+XLE = "energy"
+XLI = "industrials"
+XLB = "materials"
+XLU = "utilities"
+XLRE = "real_estate"
+XLC = "communication"
+
+[prices]
+source = "yfinance"                 # yfinance | alpaca | tiingo
+chunk_size = 150
+# stored in the macro table as YF_<name> (known at the close -> lag 0). Also the no-key fallback for FRED.
+market_tickers = ["^VIX", "^VIX3M", "^TNX", "^IRX", "^FVX", "DX-Y.NYB", "CL=F", "KRW=X", "CAD=X", "HYG", "IEF"]
+
+[labels]
+horizons = [1, 5, 10, 30]
+research_horizons = [60, 90]        # labels for backtests only (--horizons); production still trains `horizons`
+cost_bps = 10                      # round-trip cost subtracted from excess return
+embargo_extra_days = 5              # purge = horizon + this
+
+[model]
+type = "lgbm"
+train_window_days = 1260            # ~5y rolling window
+min_train_days = 504
+recency_half_life_days = 252        # sample weight halves every ~1y
+calib_days = 252                    # last part of the window used for calibration
+calib_bins = 20                     # quantile bins for calibration (robust tails)
+calib_mode = "rank"                 # rank: map the day's cross-sectional rank -> P(beat) (regime-stable) | raw
+train_date_stride = 1               # use every k-th date (speed); overlapping labels make k>1 cheap
+target_clip_quantile = 0.01         # winsorize regression target
+rank_by = "blend"                   # reg | clf | blend
+exclude_prefixes = ["rel_"]         # feature groups kept out of every config unless it sets include_prefixes
+target = "raw"                      # raw: clipped excess return | rank: per-date normal scores (pure ranking)
+refit_full = false                  # refit on the whole window (incl. the calibration holdout) after early stopping
+n_seeds = 1                         # average this many LightGBM seeds per model
+neutralize = []                     # subset of ["sector", "size", "beta"]: residualize the regression target per date
+num_threads = 0                     # 0 = all cores
+
+[model.lgbm]
+learning_rate = 0.05
+num_boost_round = 400
+early_stopping_rounds = 50
+num_leaves = 31
+min_data_in_leaf = 500
+feature_fraction = 0.8
+bagging_fraction = 0.7
+bagging_freq = 1
+lambda_l2 = 10.0
+max_bin = 63
+
+# Challengers compete with the champion config in the nightly gate.
+# Any key under [model.lgbm] can be overridden; `drop_features` removes features.
+[[challengers]]
+name = "lgbm_shallow"
+num_leaves = 15
+min_data_in_leaf = 1000
+learning_rate = 0.03
+
+[[challengers]]
+name = "lgbm_no_market"
+drop_prefixes = ["spy_", "vix", "dgs", "t10y", "hy_", "breadth", "xsec_", "curve", "credit_", "usd_", "oil_", "epu", "gpr", "days_to_fomc", "days_to_opex"]
+
+# Ablations: backtest-only feature sets (`backtest --config <name>`); not part of the nightly gate.
+[[ablations]]
+name = "refit"                      # model sees its most recent year (otherwise always >1y stale)
+refit_full = true
+
+[[ablations]]
+name = "refit_rank"
+refit_full = true
+target = "rank"
+
+[[ablations]]
+name = "refit_rank_neutral"
+refit_full = true
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+
+[[ablations]]
+name = "old_features"               # the 50 price/market features of the 2026-11-04 run
+drop_prefixes = ["news_", "sector_news", "llm_sector"]
+drop_features = ["last_surprise", "days_since_earn", "ret_since_earn", "days_to_earn", "earn_yield", "net_margin",
+                 "rev_yoy", "eps_yoy", "gp_assets", "asset_growth", "book_to_price",
+                 "ins_buy_63", "ins_nbuy_63", "ins_net_63", "si_dtc", "si_chg", "si_pct_shares"]
+
+[[ablations]]
+name = "ensemble"
+n_seeds = 5
+
+[[ablations]]
+name = "rank"
+target = "rank"
+
+[[ablations]]
+name = "rank_neutral"
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+
+[[ablations]]
+name = "rn_plain"
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "rn_release"                 # rn_plain + LLM reading of 8-K earnings releases
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+include_prefixes = ["rel_"]
+
+# ---- leak-free panel (days_to_earn estimated, earnings/fundamentals NaN filled with the daily median)
+[[ablations]]
+name = "clean"                      # same settings as rn_plain; separate tag so the old run stays comparable
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "c_hot"                      # clean settings on the panel whose gaps are random same-day draws (no fill spike)
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "c_stable"                   # clean settings; each gap = a fixed per-ticker percentile of the day's real values
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "c_long"                     # c_stable settings, separate tag for the 60/90-day runs
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "c_real"                     # first panel with real SEC fundamentals for names that left the index
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "c_real_long"                # c_real, separate tag for the 60/90-day runs
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+
+[[ablations]]
+name = "c_real_nofund"              # c_real without the 11 earnings/fundamental features
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+drop_features = ["last_surprise", "days_since_earn", "ret_since_earn", "days_to_earn", "earn_yield", "net_margin",
+                 "rev_yoy", "eps_yoy", "gp_assets", "asset_growth", "book_to_price"]
+
+[[ablations]]
+name = "c_ft100"                # c_hot with a fixed tree count instead of early stopping (total shrinkage 1.0)
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+early_stop = false
+learning_rate = 0.01
+num_boost_round = 100
+
+[[ablations]]
+name = "c_ft300"                    # same, total shrinkage 3.0
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+early_stop = false
+learning_rate = 0.01
+num_boost_round = 300
+
+[[ablations]]
+name = "c_nofund"                   # clean without the 11 earnings/fundamental features
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+drop_features = ["last_surprise", "days_since_earn", "ret_since_earn", "days_to_earn", "earn_yield", "net_margin",
+                 "rev_yoy", "eps_yoy", "gp_assets", "asset_growth", "book_to_price"]
+
+[[ablations]]
+name = "c_clfn"                     # clean + classifier target neutralized too (the blend's other half)
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+clf_neutral = true
+
+[[ablations]]
+name = "c_reg"                      # clean, ranking on the regression model only
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_"]
+rank_by = "reg"
+
+[[ablations]]
+name = "c_nomkt"                    # clean without any of the 24 market-wide features
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_", "si_", "spy_", "vix", "dgs", "t10y", "hy_", "breadth", "xsec_", "curve", "credit_", "usd_", "oil_", "epu", "gpr", "days_to_fomc", "days_to_opex"]
+
+[[ablations]]
+name = "rn_insider"
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["si_"]
+
+[[ablations]]
+name = "rn_short"
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+drop_prefixes = ["ins_"]
+
+[[ablations]]
+name = "rn_both"
+target = "rank"
+neutralize = ["sector", "size", "beta"]
+
+[[ablations]]
+name = "no_news"
+drop_prefixes = ["news_", "sector_news", "llm_sector"]
+
+[[ablations]]
+name = "news_old"                   # news features before the 2026-11-08 additions
+drop_features = ["news_attn_1d", "news_attn_5d", "news_sent_20d", "news_sent_chg", "news_csent_5d",
+                 "news_earn_sent_5d", "news_rating_sent_5d", "news_legal_5d", "news_ma_5d"]
+
+[backtest]
+start_test = "2019-01-01"
+holdout_start = "2025-11-01"        # locked: evaluated only with `backtest --final` (once, at the very end)
+retrain_every_days = 63
+top_k = 10
+
+[portfolio]                         # portfolio-level backtest (eval/portfolio.py)
+k = 50                              # names held
+buffer = 3.0                        # keep a held name while it ranks inside top k*buffer (turnover control)
+rebalance = 5                       # trading days between rebalances (P&L on 5d forward excess vs SPY)
+weighting = "equal"                 # equal | inv_vol (inv_vol + sector cap lost money in the 2019-2025 test)
+sector_cap = 0                      # max share of names per sector (0 = off)
+smooth = 1                          # average the last N daily scores before ranking
+ensemble_horizons = [5, 10, 30]
+tilt_strength = 0.5                  # enhanced index: cap weight x exp(0.5 * score z); 0 = off
+tilt_max_mult = 3.0                 # at most 3x a name cap weight
+
+[backtest.fast]                     # `--fast`: quick iteration preset
+horizons = [5]
+retrain_every_days = 126
+train_date_stride = 3
+
+[gate]
+holdout_days = 60
+gate_horizons = [5]
+metric = "rank_ic"
+min_improvement = 0.005             # challenger must beat champion by this much
+keep_versions = 10
+min_pred_corr = 0.2                 # sanity: nightly refit must correlate with previous version
+
+[signals]
+prob_threshold = 0.57
+high_conf_extra = 0.03              # tier 5-7 needs threshold + this
+min_edge = 0.0                      # net (after-cost) expected excess must exceed this
+atr_stop_mult = 2.0
+min_stop_pct = 0.02
+max_stop_pct = 0.15
+exclude_earnings_in_window = true   # holding through earnings is unvalidated -> excluded
+signal_horizons = [1, 5, 10, 30]
+education_experience = ["none", "beginner"]
+
+[signals.tiers.none]
+risk_min = 1
+risk_max = 4
+max_positions = 0
+
+[signals.tiers.mid]
+risk_min = 5
+risk_max = 7
+max_positions = 3
+risk_per_trade = 0.005
+weekly_loss_limit = 0.02
+max_position_pct = 0.15
+universe = "etf_megacap"
+
+[signals.tiers.high]
+risk_min = 8
+risk_max = 10
+max_positions = 6
+risk_per_trade = 0.01
+weekly_loss_limit = 0.04
+max_position_pct = 0.20
+universe = "all"
+
+[killswitch]
+lookback_days = 60
+primary_horizon = 5
+min_samples = 200
+min_net_per_trade = -0.002
+min_hit_rate = 0.45
+max_stale_days = 4                  # data older than this halts signals
+
+[news]
+cutoff_et = "16:00"                 # news received after this belongs to the next trading day
+finnhub_max_tickers = 520
+backfill_days = 365
+rss_feeds = [
+  "https://www.federalreserve.gov/feeds/press_all.xml",
+  "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+  "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+]
+
+[gdelt]
+themes = { conflict = "(war OR military OR missile OR airstrike)", sanctions = "sanctions", tariffs = "(tariff OR \"trade war\")", oil = "(oil supply OR OPEC)", central_bank = "(\"central bank\" OR \"interest rate\")" }
+
+[llm]
+max_retries = 2
+temperature = 0.2
+news_batch = 8
+explain_max_tokens = 700
+# extra_body is merged into chat requests (e.g. disable Qwen thinking on vLLM/llama.cpp)
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[rag]
+backend = "tfidf"                   # tfidf | bge-m3 (needs sentence-transformers)
+
+[review]
+max_reviews_per_night = 40
+
+[tracking]
+mlflow = false                      # set true after `pip install mlflow`
+
+# FRED series: lag_days = days after observation date before the value is assumed known
+[fred.series]
+DGS10 = 1
+DGS2 = 1
+T10Y2Y = 1
+DFF = 1
+BAMLH0A0HYM2 = 1
+DTWEXBGS = 1
+DCOILWTICO = 1
+DEXKOUS = 1
+DEXCAUS = 1
+CPIAUCSL = 45
+UNRATE = 40
+PAYEMS = 40

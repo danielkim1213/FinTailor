@@ -1,0 +1,22 @@
+pandas>=2.2
+numpy>=1.26
+pyarrow>=15
+duckdb>=1.0
+lightgbm>=4.3
+scikit-learn>=1.4
+scipy>=1.11
+yfinance>=0.2.50
+requests>=2.31
+python-dotenv>=1.0
+pydantic>=2.6
+feedparser>=6.0
+lxml>=5.0
+tzdata
+xlrd>=2.0
+streamlit>=1.35
+plotly>=5.20
+fastapi>=0.110
+uvicorn>=0.29
+pytest>=8.0
+# optional: mlflow, sentence-transformers (rag backend bge-m3)
+# Colab training extras: unsloth, trl, datasets (installed in the notebook)

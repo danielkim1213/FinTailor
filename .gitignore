@@ -1,0 +1,24 @@
+# personal notes / conversational docs (not for GitHub)
+README.md
+FinTailor_final_plan.txt
+*_plan.txt
+notes/
+
+.venv/
+__pycache__/
+*.pyc
+.env
+store/
+store_demo/
+training/data/
+*.duckdb
+*.duckdb.wal
+.pytest_cache/
+mlruns/
+store_news/
+store_wide/
+store*/
+training/data_pilot/
+*.zip
+*.parquet
+.github/workflows/nightly.yml
