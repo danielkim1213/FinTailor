@@ -53,6 +53,9 @@ class LLMClient:
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens,
                 "temperature": self.cfg["temperature"] if temperature is None else temperature}
         body.update(self.cfg.get("extra_body", {}))
+        if "openrouter.ai" in self.base_url:
+            # reasoning models would burn max_tokens on hidden thinking and return empty content
+            body["reasoning"] = {"enabled": False}
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         t0 = time.time()

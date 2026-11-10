@@ -12,6 +12,7 @@ from ..models.lgbm import fit_horizon, ranking_score, select_features
 from ..models.registry import config_overrides, train_window
 from ..utils import log
 from .metrics import evaluate, gate_check, summary_table
+from .portfolio import portfolio_report, print_report
 
 BASELINES = {
     "reversal_1w": lambda p: -p["ret_5"],
@@ -73,14 +74,14 @@ def walk_forward(panel: pd.DataFrame, hs: list[int] | None = None, config_name: 
                 continue
             m = fit_horizon(tr, feats, h, ov)
             pr = m.predict(test)
-            out.append(_frame(test, h, ranking_score(pr), pr["prob"]).assign(pred_excess=pr["pred_excess"].values))
+            out.append(_frame(test, h, ranking_score(pr, ov.get("rank_by")), pr["prob"]).assign(pred_excess=pr["pred_excess"].values))
         log.info("walk-forward [%s] block %d/%d %s..%s (%.0fs)", config_name, bi + 1, len(blocks), d0.date(),
                  d1.date(), time.time() - t0)
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
 def run_backtest(panel: pd.DataFrame, fast: bool = False, config_name: str = "base", hs: list[int] | None = None,
-                 start_test: str | None = None, save: bool = True) -> dict:
+                 start_test: str | None = None, save: bool = True, final: bool = False) -> dict:
     cfg = get_config()
     k = cfg["backtest"]["top_k"]
     kw = {}
@@ -89,7 +90,14 @@ def run_backtest(panel: pd.DataFrame, fast: bool = False, config_name: str = "ba
         hs = hs or f["horizons"]
         kw = dict(retrain_every=f["retrain_every_days"], stride=f["train_date_stride"])
     hs = hs or horizons()
-    oos = walk_forward(panel, hs, config_name, start_test, **kw)
+    # Locked holdout: dates from holdout_start on are only evaluated with --final (once, at the end).
+    # Tuning on them would turn the last honest test into one more in-sample period.
+    hold = cfg["backtest"].get("holdout_start")
+    end_test = None
+    if hold and not final:
+        end_test = str((pd.Timestamp(hold) - pd.Timedelta(days=1)).date())
+        log.info("backtest ends %s (locked holdout from %s; use --final to include it)", end_test, hold)
+    oos = walk_forward(panel, hs, config_name, start_test, end_test=end_test, **kw)
     res = {}
     for h in hs:
         d = oos[oos["horizon"] == h]
@@ -100,6 +108,14 @@ def run_backtest(panel: pd.DataFrame, fast: bool = False, config_name: str = "ba
         res[f"model[{config_name}]@{h}d"] = r
     if not oos.empty:
         res.update(run_baselines(panel, str(oos["date"].min().date()), hs))
+        if "g_5" in panel:
+            rets = pd.DataFrame({"date": panel["date"].values, "ticker": panel["ticker"].values,
+                                 "r": panel["g_5"].values, "vol": panel["atr_pct_raw"].values,
+                                 "sector": panel["sector"].astype(str).values,
+                                 "mcap": panel["mcap"].values if "mcap" in panel else np.nan,
+                                 "dvol": panel["dvol20"].values})
+            rets = rets[rets["date"].isin(oos["date"].unique())]
+            res["_portfolio"] = portfolio_report(oos, rets, hs, cfg, cost())
     if save:
         d = store_dir("backtests")
         tag = f"{pd.Timestamp.now():%Y%m%d_%H%M%S}_{config_name}{'_fast' if fast else ''}"
@@ -107,4 +123,6 @@ def run_backtest(panel: pd.DataFrame, fast: bool = False, config_name: str = "ba
         (d / f"{tag}.json").write_text(json.dumps(res, indent=1, default=str))
         res["_files"] = {"oos": str(d / f"{tag}_oos.parquet"), "report": str(d / f"{tag}.json")}
     print(summary_table({k_: v for k_, v in res.items() if not k_.startswith("_")}).to_string(float_format=lambda x: f"{x:.4f}"))
+    if res.get("_portfolio"):
+        print_report(res["_portfolio"])
     return res

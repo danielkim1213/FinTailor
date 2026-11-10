@@ -26,14 +26,16 @@ def model_params(overrides: dict | None = None) -> dict:
 def select_features(all_feats: list[str], overrides: dict | None = None) -> list[str]:
     o = overrides or {}
     drop = set(o.get("drop_features", []))
-    pref = tuple(o.get("drop_prefixes", []))
+    include = set(o.get("include_prefixes", []))  # opt in to a globally excluded group
+    excluded = [x for x in get_config()["model"].get("exclude_prefixes", []) if x not in include]
+    pref = tuple(o.get("drop_prefixes", [])) + tuple(excluded)
     return [f for f in all_feats if f not in drop and not (pref and f.startswith(pref))]
 
 
-def _lgb_params(p: dict, objective: str) -> dict:
+def _lgb_params(p: dict, objective: str, seed: int = 17) -> dict:
     cfg = get_config()["model"]
     out = {k: v for k, v in p.items() if k not in ("num_boost_round", "early_stopping_rounds")}
-    out.update(objective=objective, verbosity=-1, num_threads=cfg.get("num_threads", 0), seed=17,
+    out.update(objective=objective, verbosity=-1, num_threads=cfg.get("num_threads", 0), seed=seed,
                deterministic=False, force_col_wise=True)
     return out
 
@@ -44,6 +46,27 @@ def recency_weights(dates: pd.Series, half_life_days: float) -> np.ndarray:
     pos = np.searchsorted(u, d.values)
     age = (len(u) - 1) - pos
     return np.power(0.5, age / max(half_life_days, 1)).astype(np.float32)
+
+
+class AvgBooster:
+    """Average of several LightGBM boosters (same data, different seeds); quacks like a Booster for predict."""
+
+    def __init__(self, boosters: list[lgb.Booster]):
+        self.boosters = boosters
+        self.best_iteration = boosters[0].best_iteration
+
+    def predict(self, X, **kw):
+        return np.mean([b.predict(X, **kw) for b in self.boosters], axis=0)
+
+
+def _save_booster(b, d: Path, stem: str) -> None:
+    for i, x in enumerate(b.boosters if isinstance(b, AvgBooster) else [b]):
+        x.save_model(str(d / (f"{stem}.txt" if i == 0 else f"{stem}_s{i}.txt")))
+
+
+def _load_booster(d: Path, stem: str, n: int):
+    bs = [lgb.Booster(model_file=str(d / (f"{stem}.txt" if i == 0 else f"{stem}_s{i}.txt"))) for i in range(n)]
+    return bs[0] if n == 1 else AvgBooster(bs)
 
 
 @dataclass
@@ -83,8 +106,8 @@ class HorizonModel:
     # ------------------------------------------------------------------ io
     def save(self, d: Path) -> None:
         d.mkdir(parents=True, exist_ok=True)
-        self.reg.save_model(str(d / f"reg_{self.horizon}.txt"))
-        self.clf.save_model(str(d / f"clf_{self.horizon}.txt"))
+        _save_booster(self.reg, d, f"reg_{self.horizon}")
+        _save_booster(self.clf, d, f"clf_{self.horizon}")
         (d / f"cal_{self.horizon}.json").write_text(json.dumps({
             "features": self.features, "iso_x": self.iso_x.tolist(), "iso_y": self.iso_y.tolist(),
             "exp_x": self.exp_x.tolist(), "exp_y": self.exp_y.tolist(), "info": self.info}))
@@ -92,8 +115,9 @@ class HorizonModel:
     @classmethod
     def load(cls, d: Path, h: int) -> "HorizonModel":
         c = json.loads((d / f"cal_{h}.json").read_text())
-        return cls(h, c["features"], lgb.Booster(model_file=str(d / f"reg_{h}.txt")),
-                   lgb.Booster(model_file=str(d / f"clf_{h}.txt")), np.array(c["iso_x"]), np.array(c["iso_y"]),
+        n = int(c.get("info", {}).get("n_seeds", 1))
+        return cls(h, c["features"], _load_booster(d, f"reg_{h}", n),
+                   _load_booster(d, f"clf_{h}", n), np.array(c["iso_x"]), np.array(c["iso_y"]),
                    np.array(c["exp_x"]), np.array(c["exp_y"]), c.get("info", {}))
 
 
@@ -129,22 +153,47 @@ def fit_horizon(train: pd.DataFrame, features: list[str], h: int, overrides: dic
     fit = d[d["date"] <= fit_end]
     cal = d[d["date"] >= cal_start]
 
-    y = fit[y_col].to_numpy(np.float64)
+    ov = overrides or {}
+    target_mode = ov.get("target", mcfg.get("target", "raw"))
+    refit = bool(ov.get("refit_full", mcfg.get("refit_full", False)))
+    n_seeds = int(ov.get("n_seeds", mcfg.get("n_seeds", 1)))
     q = mcfg.get("target_clip_quantile", 0.01)
+    y = fit[y_col].to_numpy(np.float64)
     lo, hi = np.nanquantile(y, [q, 1 - q])
-    w = recency_weights(fit["date"], mcfg["recency_half_life_days"] / stride)
+
+    neutral = list(ov.get("neutralize", mcfg.get("neutralize", [])))
+
+    def reg_target(frame: pd.DataFrame) -> np.ndarray:
+        yv = frame[y_col]
+        if neutral:  # remove what sector / size / beta explain that day (don't learn "megacaps went up")
+            yv = pd.Series(_neutralize(frame, y_col, neutral), index=frame.index)
+        if target_mode == "rank":  # per-date normal scores: pure cross-sectional ranking, no fat tails
+            return _rank_gauss(yv, frame["date"])
+        return np.clip(yv.to_numpy(np.float64), lo, hi)
+
+    half = mcfg["recency_half_life_days"] / stride
+    w = recency_weights(fit["date"], half)
     Xf, Xc = _matrix(fit, features), _matrix(cal, features)
     yc = cal[y_col].to_numpy(np.float64)
     nbr, esr = p.get("num_boost_round", 400), p.get("early_stopping_rounds", 50)
 
+    early_stop = bool(ov.get("early_stop", mcfg.get("early_stop", True)))
+    clf_neutral = bool(ov.get("clf_neutral", False)) and bool(neutral)
+    seed_base = int(ov.get("seed_base", 17))
+
+    def clf_target(frame: pd.DataFrame, raw: np.ndarray) -> np.ndarray:
+        return ((_neutralize(frame, y_col, neutral) if clf_neutral else raw) > 0).astype(float)
+
     def train_one(obj, target, target_cal):
         ds = lgb.Dataset(Xf, target, weight=w, feature_name=features, free_raw_data=True)
+        if not early_stop:
+            return lgb.train(_lgb_params(p, obj, seed_base), ds, num_boost_round=nbr)
         dv = lgb.Dataset(Xc, target_cal, reference=ds)
-        return lgb.train(_lgb_params(p, obj), ds, num_boost_round=nbr, valid_sets=[dv],
+        return lgb.train(_lgb_params(p, obj, seed_base), ds, num_boost_round=nbr, valid_sets=[dv],
                          callbacks=[lgb.early_stopping(esr, verbose=False)])
 
-    reg = train_one("regression", np.clip(y, lo, hi), np.clip(yc, lo, hi))
-    clf = train_one("binary", (y > 0).astype(float), (yc > 0).astype(float))
+    reg = train_one("regression", reg_target(fit), reg_target(cal))
+    clf = train_one("binary", clf_target(fit, y), clf_target(cal, yc))
 
     mode = mcfg.get("calib_mode", "rank")
     raw_c, reg_c = clf.predict(Xc), reg.predict(Xc)
@@ -154,8 +203,74 @@ def fit_horizon(train: pd.DataFrame, features: list[str], h: int, overrides: dic
     ex, ey = binned_isotonic(reg_c, yc, mcfg.get("calib_bins", 20))
     info = {"n_fit": len(fit), "n_cal": len(cal), "fit_end": str(pd.Timestamp(fit_end).date()),
             "train_end": str(pd.Timestamp(udates[-1]).date()), "train_start": str(pd.Timestamp(udates[0]).date()),
-            "best_iter_reg": reg.best_iteration, "best_iter_clf": clf.best_iteration, "calib_mode": mode}
+            "best_iter_reg": reg.best_iteration, "best_iter_clf": clf.best_iteration, "calib_mode": mode,
+            "target": target_mode, "refit_full": False, "n_seeds": n_seeds}
+    if refit and mode == "rank":
+        # The holdout above only picks the number of rounds and the calibration map. Without a refit the model
+        # would never see its most recent ~calib_days of data (a year-old model; also hides any recent feature
+        # such as news). Rank calibration maps the day's cross-sectional rank -> outcome, so it transfers to the
+        # refit booster. Raw-score calibration would not, hence rank mode only.
+        Xa = _matrix(d, features)
+        wa = recency_weights(d["date"], half)
+        ya = d[y_col].to_numpy(np.float64)
+
+        def refit_one(obj, target, iters):
+            bs = [lgb.train(_lgb_params(p, obj, seed_base + i), lgb.Dataset(Xa, target, weight=wa, feature_name=features),
+                            num_boost_round=max(int(round(iters * 1.1)), 10)) for i in range(n_seeds)]
+            return bs[0] if n_seeds == 1 else AvgBooster(bs)
+
+        reg = refit_one("regression", reg_target(d), reg.best_iteration or nbr)
+        clf = refit_one("binary", clf_target(d, ya), clf.best_iteration or nbr)
+        info.update(refit_full=True, refit_end=str(pd.Timestamp(udates[-1]).date()))
+    elif n_seeds > 1:  # same rounds and data as the early-stopped model, other seeds
+        def more(obj, target, first):
+            extra = [lgb.train(_lgb_params(p, obj, seed_base + i), lgb.Dataset(Xf, target, weight=w, feature_name=features),
+                               num_boost_round=first.best_iteration or nbr) for i in range(1, n_seeds)]
+            return AvgBooster([first] + extra)
+
+        reg = more("regression", reg_target(fit), reg)
+        clf = more("binary", clf_target(fit, y), clf)
     return HorizonModel(h, features, reg, clf, px, py, ex, ey, info)
+
+
+def _neutralize(frame: pd.DataFrame, y_col: str, what: list[str]) -> np.ndarray:
+    """Per-date OLS residual of the target on sector dummies and/or size (log_dvol) and beta (beta_60)."""
+    y = frame[y_col].to_numpy(np.float64)
+    out = np.full(len(frame), np.nan)
+    cols = [c for c, key in (("log_dvol", "size"), ("beta_60", "beta")) if key in what and c in frame]
+    sec = frame["sector"].astype(str).to_numpy() if "sector" in what and "sector" in frame else None
+    dates = frame["date"].to_numpy()
+    order = np.argsort(dates, kind="stable")
+    sd = dates[order]
+    bounds = np.flatnonzero(np.r_[True, sd[1:] != sd[:-1], True])
+    num = frame[cols].to_numpy(np.float64) if cols else np.zeros((len(frame), 0))
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        idx = order[a:b]
+        yi = y[idx]
+        ok = np.isfinite(yi)
+        if ok.sum() < 20:
+            continue
+        parts = [np.ones((len(idx), 1))]
+        if cols:
+            xi = num[idx]
+            fill = np.nanmean(np.where(np.isfinite(xi), xi, np.nan), axis=0)
+            parts.append(np.where(np.isfinite(xi), xi, np.nan_to_num(fill)))
+        if sec is not None:
+            levels, inv = np.unique(sec[idx], return_inverse=True)
+            if len(levels) > 1:
+                parts.append(np.eye(len(levels))[inv][:, 1:])
+        X = np.nan_to_num(np.hstack(parts))
+        coef, *_ = np.linalg.lstsq(X[ok], yi[ok], rcond=None)
+        out[idx[ok]] = yi[ok] - X[ok] @ coef
+    return out
+
+
+def _rank_gauss(y: pd.Series, dates: pd.Series) -> np.ndarray:
+    """Per-date rank -> standard normal score (NaN stays NaN)."""
+    from scipy.special import ndtri
+    g = pd.Series(y.to_numpy(np.float64), index=y.index).groupby(dates.values)
+    r, n = g.rank(method="average"), g.transform("count")
+    return ndtri(((r - 0.5) / n).clip(1e-4, 1 - 1e-4)).to_numpy(np.float64)
 
 
 def binned_isotonic(score: np.ndarray, y: np.ndarray, bins: int = 20) -> tuple[np.ndarray, np.ndarray]:
@@ -176,8 +291,8 @@ def binned_isotonic(score: np.ndarray, y: np.ndarray, bins: int = 20) -> tuple[n
     return xm, fit
 
 
-def ranking_score(pred: pd.DataFrame) -> pd.Series:
-    mode = get_config()["model"].get("rank_by", "blend")
+def ranking_score(pred: pd.DataFrame, mode: str | None = None) -> pd.Series:
+    mode = mode or get_config()["model"].get("rank_by", "blend")
     if mode == "reg":
         return pred["pred_raw"]
     if mode == "clf":

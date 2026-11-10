@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import json
 import time
+import zlib
 
+import duckdb
 import numpy as np
 import pandas as pd
 
@@ -23,6 +25,8 @@ from ..db import connect
 from ..utils import assign_trading_date, log
 
 AUX = ["raw_close", "atr_pct_raw", "dvol20", "sector", "is_etf_flag", "days_to_earn_raw"]
+EARN_FUND = ["last_surprise", "days_since_earn", "ret_since_earn", "days_to_earn", "earn_yield", "net_margin",
+             "rev_yoy", "eps_yoy", "gp_assets", "asset_growth", "book_to_price"]
 
 
 def label_cols(hs=None) -> list[str]:
@@ -57,6 +61,23 @@ def _days_to_next(event_dates: pd.DatetimeIndex, dates: pd.DatetimeIndex, cap: i
     return np.minimum(out, cap)
 
 
+def _days_to_earn_estimate(event_dates, dates: pd.DatetimeIndex, cap: int = 90, stale_after: int = 150) -> np.ndarray:
+    """Point-in-time guess of days to the next report: the last report already known plus the median of its
+    recent gaps. The actual next date is not used, since historically it was not known in advance."""
+    ev = np.unique(np.asarray(event_dates, dtype="datetime64[ns]"))
+    out = np.full(len(dates), np.nan)
+    if len(ev) == 0:
+        return out
+    gaps = pd.Series(np.diff(ev) / np.timedelta64(1, "D"), dtype=float)
+    typical = np.r_[91.0, gaps.rolling(8, min_periods=1).median().clip(60, 120).to_numpy()]
+    i = np.searchsorted(ev, dates.values, side="right") - 1
+    ok = np.flatnonzero(i >= 0)
+    elapsed = (dates.values[ok] - ev[i[ok]]) / np.timedelta64(1, "D")
+    est = np.clip(typical[i[ok]] - elapsed, 0, cap)
+    out[ok] = np.where(elapsed > stale_after, np.nan, est)
+    return out
+
+
 def _event_wide(df: pd.DataFrame, value: str, dates, tickers, agg="sum") -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(np.nan, index=dates, columns=tickers)
@@ -74,7 +95,7 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
     ucfg = cfg["universe"]
     bench = ucfg["benchmark"]
     etf_map = sector_etfs()
-    H = horizons()
+    H = sorted({*horizons(), *get_config()["labels"].get("research_horizons", [])})  # extras: labels only, never trained live
     c_ = cost()
 
     px = con.execute("select ticker, date, open, high, low, close, adj_close, raw_close, volume, vwap "
@@ -162,6 +183,12 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
         sidx[upd] = j
     for j, e in enumerate(etf_list):
         sidx[:, col_of[e]] = j
+    # A published GICS sector beats the estimate above, which puts Apple in consumer staples in some years. The estimate
+    # remains for companies that left the index, whose GICS sector the source no longer lists.
+    sector_pos = {k: j for j, k in enumerate(sec_keys)}
+    for r in univ.itertuples():
+        if r.sector in sector_pos and r.ticker in col_of and r.ticker not in etf_map:
+            sidx[:, col_of[r.ticker]] = sector_pos[r.sector]
     for k in (5, 20):
         etf_ret = F[f"ret_{k}"][etf_list].values
         sec_ret = _take(etf_ret, sidx)
@@ -175,7 +202,8 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
 
     # ---- news (ticker-level), sector news + LLM sector view
     news = con.execute("""
-        select n.ticker, n.received_at, s.sentiment, s.severity, s.novelty, s.payload
+        select n.ticker, n.received_at, s.sentiment, s.severity, s.novelty, s.payload, s.event_type,
+               try_cast(json_extract_string(s.payload, '$.confidence') as double) as confidence
         from news n join (select *, row_number() over (partition by news_id order by
             case scorer when 'llm' then 0 when 'synthetic' then 1 else 2 end) rn from news_scores) s
           on s.news_id = n.id and s.rn = 1""").df()
@@ -198,6 +226,36 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
         RAW["news_sevsent_5d"] = swsum.rolling(5, min_periods=1).sum()
         RAW["news_novel_5d"] = (nsum.rolling(5, min_periods=1).sum() / c5).where(c5 > 0)
         for k in ("news_cnt_1d", "news_cnt_5d", "news_sevsent_5d"):
+            RAW[k].loc[pre] = np.nan
+
+        # abnormal attention: coverage vs the ticker's own past 60 days (raw counts mostly say "megacap")
+        base = cnt.shift(5).rolling(60, min_periods=20).mean()
+        warm = dates < dates[min(int(np.searchsorted(dates, first_news)) + 25, len(dates) - 1)]
+        RAW["news_attn_1d"] = np.log((cnt + 1) / (base + 1))
+        RAW["news_attn_5d"] = np.log((c5 + 1) / (base * 5 + 1))
+        # longer window: post-news drift plays out over weeks (we predict up to 30 days)
+        c20, s20 = cnt.rolling(20, min_periods=1).sum(), ssum.rolling(20, min_periods=1).sum()
+        RAW["news_sent_20d"] = (s20 / c20).where(c20 > 0)
+        RAW["news_sent_chg"] = RAW["news_sent_5d"] - RAW["news_sent_20d"]  # tone shift
+        # confidence-weighted tone (the scorer's own certainty; lexicon = constant 0.3)
+        tk["conf"] = tk["confidence"].fillna(0.5).clip(0, 1)
+        tk["sc"] = tk["sentiment"] * tk["conf"]
+        csum = _event_wide(tk, "conf", dates, tickers).fillna(0).rolling(5, min_periods=1).sum()
+        scsum = _event_wide(tk, "sc", dates, tickers).fillna(0).rolling(5, min_periods=1).sum()
+        RAW["news_csent_5d"] = (scsum / csum).where(csum > 0)
+        # event types: the scorer classifies them, so use them ("guidance cut" != "negative op-ed").
+        # Sums over 5 days: 0 = no such news (informative), sign/size = direction and weight.
+        et = tk["event_type"].fillna("other")
+        for name, kinds, val in (("news_earn_sent_5d", ("earnings", "guidance"), "sentiment"),
+                                 ("news_rating_sent_5d", ("analyst_rating",), "sentiment"),
+                                 ("news_legal_5d", ("legal_regulatory",), "one"),
+                                 ("news_ma_5d", ("m_and_a",), "one")):
+            sub = tk[et.isin(kinds)]
+            w = _event_wide(sub, val, dates, tickers).fillna(0).rolling(5, min_periods=1).sum()
+            RAW[name] = np.log1p(w) if val == "one" else w
+        for k in ("news_attn_1d", "news_attn_5d"):
+            RAW[k].loc[warm] = np.nan
+        for k in ("news_earn_sent_5d", "news_rating_sent_5d", "news_legal_5d", "news_ma_5d"):
             RAW[k].loc[pre] = np.nan
         # sector impact from macro / world news payloads
         gen = news[news["payload"].fillna("").str.contains("sector_impact")]
@@ -228,6 +286,13 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
     # ---- earnings
     earn = con.execute("select ticker, date, announced_at, eps_actual, eps_estimate from earnings").df()
     days_to_earn = pd.DataFrame(np.nan, index=dates, columns=tickers)
+    # yfinance has no history for most delisted names: there, the 10-Q/10-K filing date is a slightly late report date
+    # that was public at the time, so the timing features exist for them too.
+    reported = set(earn.loc[earn["eps_actual"].notna(), "ticker"])
+    filed_events = con.execute("select distinct ticker, filed as date from fundamentals").df()
+    filed_events = filed_events[~filed_events["ticker"].isin(reported)]
+    if len(filed_events):
+        earn = pd.concat([earn, filed_events.assign(announced_at=pd.NaT, eps_actual=np.nan, eps_estimate=np.nan)], ignore_index=True)
     if len(earn):
         earn["date"] = pd.to_datetime(earn["date"])
         earn["announced_at"] = pd.to_datetime(earn["announced_at"]).fillna(earn["date"] + pd.Timedelta(hours=21))
@@ -247,7 +312,10 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
             (dates.values[:, None] - last_d.values.astype("datetime64[ns]")) / np.timedelta64(1, "D"),
             index=dates, columns=tickers)
         F["ret_since_earn"] = C / C.where(flag).ffill(limit=90) - 1
-        RAW["days_to_earn"] = days_to_earn
+        est_days = np.full((T, N), np.nan)
+        for t, g in known.groupby("ticker"):
+            est_days[:, col_of[t]] = _days_to_earn_estimate(g["tdate"].values, dates)
+        RAW["days_to_earn"] = pd.DataFrame(est_days, index=dates, columns=tickers)  # the model feature; days_to_earn_raw
 
     # ---- filings (8-K, Form 4)
     fil = con.execute("select ticker, form, accepted_at, filing_date from filings").df()
@@ -262,17 +330,102 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
             RAW[name] = w
 
     # ---- fundamentals (as of filed date + 1 business day)
-    fun = con.execute("select ticker, filed, rev_ttm, ni_ttm, eps_ttm, rev_ttm_yoy, eps_ttm_yoy from fundamentals").df()
+    MCAP = None
+    SHARES = None
+    fun = con.execute("select ticker, filed, rev_ttm, ni_ttm, eps_ttm, rev_ttm_yoy, eps_ttm_yoy, gp_ttm, assets, "
+                      "assets_yoy, equity, shares from fundamentals").df()
     if len(fun):
         fun["tdate"] = pd.to_datetime(fun["filed"]) + pd.offsets.BDay(1)
-        fun = fun[fun["ticker"].isin(tickers)]
+        fun = fun[fun["ticker"].isin(tickers)].copy()
+        # A share count or EPS filed before a stock split no longer matches later prices. raw / split-adjusted close is the
+        # splits still to come, so multiplying shares by it on the filing date puts them in the split-adjusted close's units.
+        split_f = (RC / CS).where(lambda x: x > 0).ffill().bfill().fillna(1.0)
+        at_filing = split_f.values[np.clip(dates.searchsorted(fun["tdate"].values, side="right") - 1, 0, T - 1),
+                                   fun["ticker"].map(col_of).to_numpy()]
+        fun["shares_adj"] = fun["shares"].where(fun["shares"] > 0) * at_filing
+        fun["eps_adj"] = fun["eps_ttm"] / at_filing
+
         def fw(col):
             w = fun.pivot_table(index="tdate", columns="ticker", values=col, aggfunc="last")
             return w.reindex(w.index.union(dates)).ffill(limit=400).reindex(index=dates, columns=tickers)
-        F["earn_yield"] = fw("eps_ttm") / RC
         F["net_margin"] = fw("ni_ttm") / fw("rev_ttm")
         F["rev_yoy"] = fw("rev_ttm_yoy")
         F["eps_yoy"] = fw("eps_ttm_yoy").clip(-5, 5)
+        # classic cross-sectional factors (Novy-Marx gross profitability, asset growth, book-to-price)
+        assets = fw("assets").where(lambda a: a > 0)
+        F["gp_assets"] = fw("gp_ttm") / assets
+        F["asset_growth"] = fw("assets_yoy").clip(-0.9, 5)
+        adj_shares = fw("shares_adj")
+        SHARES = adj_shares / split_f
+        dv = dvol20.where(dvol20 > 0)
+        known = (adj_shares * CS).where(lambda x: x > 0)
+        # Some large multi-class filers publish no usable total share count. Those names, and counts wildly out of line with
+        # trading volume (unit errors), get cap = volume x the day's typical cap/volume ratio among the 200 most-traded stocks.
+        ratio = known / dv
+        typical = ratio.where(dv.rank(axis=1, ascending=False) <= 200).median(axis=1)
+        sane = ratio.gt(typical / 15, axis=0) & ratio.lt(typical * 15, axis=0)
+        company_cap = known.where(sane).fillna(dv.mul(typical, axis=0))
+        F["earn_yield"] = (fw("eps_adj") / CS).fillna(fw("ni_ttm") / company_cap)
+        F["book_to_price"] = (fw("equity") / company_cap).clip(-5, 5)
+        # Share classes of one company (GOOG/GOOGL) carry the same filing and share count; without this each class would be
+        # weighted as the whole company. The company's cap is divided between its classes by trading volume.
+        same = fun.dropna(subset=["shares"]).groupby(["filed", "shares"])["ticker"].agg(lambda s: tuple(sorted(set(s))))
+        class_groups = [g for g, n in same[same.map(len) > 1].value_counts().items() if n >= 3]
+        class_share = pd.DataFrame(1.0, index=dates, columns=tickers)
+        for g in class_groups:
+            cols = list(g)
+            class_share[cols] = dv[cols].div(dv[cols].sum(axis=1, min_count=1), axis=0).fillna(1.0 / len(cols))
+        MCAP = company_cap * class_share
+
+    def _table(sql: str) -> pd.DataFrame:  # optional tables (absent in demo / fresh stores)
+        try:
+            return con.execute(sql).df()
+        except duckdb.Error:
+            return pd.DataFrame()
+
+    # ---- insider open-market trades (Form 4, P/S), usable the trading day after the filing date
+    ins = _table("select ticker, filing_date, code, value, officer, director from insider_trades")
+    if len(ins):
+        ins = ins[ins["ticker"].isin(tickers) & (ins["officer"] | ins["director"])]
+        ins["tdate"] = assign_trading_date(pd.to_datetime(ins["filing_date"]) + pd.Timedelta(hours=22), dates, news_cut)
+        ins = ins.dropna(subset=["tdate"]).assign(one=1.0, v=lambda d: d["value"].fillna(0).clip(0, 5e9))  # data sets contain typos up to $1e16
+        start_i = ins["tdate"].min()
+        buy, sell = ins[ins["code"] == "P"], ins[ins["code"] == "S"]
+        bval = _event_wide(buy, "v", dates, tickers).fillna(0).rolling(63, min_periods=1).sum()
+        sval = _event_wide(sell, "v", dates, tickers).fillna(0).rolling(63, min_periods=1).sum()
+        bcnt = _event_wide(buy, "one", dates, tickers).fillna(0).rolling(63, min_periods=1).sum()
+        month_dvol = (dvol20 * 20).where(dvol20 > 0)
+        RAW["ins_buy_63"] = np.log1p(1e4 * bval / month_dvol)          # bp of a month's $ volume
+        RAW["ins_nbuy_63"] = np.log1p(bcnt)                              # clustered buying
+        RAW["ins_net_63"] = np.sign(bval - sval) * np.log1p(1e4 * (bval - sval).abs() / month_dvol)
+        for k in ("ins_buy_63", "ins_nbuy_63", "ins_net_63"):
+            RAW[k].loc[dates < start_i + pd.Timedelta(days=90)] = np.nan
+
+    # ---- short interest (FINRA), usable from settlement + 10 business days
+    si = _table("select ticker, settlement_date, short_qty, days_to_cover from short_interest")
+    if len(si):
+        si = si[si["ticker"].isin(tickers)].sort_values(["ticker", "settlement_date"])
+        si["avail"] = pd.to_datetime(si["settlement_date"]) + pd.offsets.BDay(10)
+        si["chg"] = np.log((si["short_qty"] + 1) / (si.groupby("ticker")["short_qty"].shift(1) + 1))
+
+        def sw(col):
+            w = si.pivot_table(index="avail", columns="ticker", values=col, aggfunc="last")
+            return w.reindex(w.index.union(dates)).ffill(limit=30).reindex(index=dates, columns=tickers)
+        qty = sw("short_qty")
+        F["si_dtc"] = sw("days_to_cover").clip(0, 60)
+        F["si_chg"] = sw("chg").clip(-3, 3)
+        if SHARES is not None:
+            F["si_pct_shares"] = (qty / SHARES.where(SHARES > 0)).clip(0, 1)
+
+    # ---- LLM reading of 8-K earnings releases, usable from the SEC acceptance time; held until the next quarter
+    rel = _table("""select r.ticker, r.accepted_at, s.g, s.t, s.s, s.x from earnings_releases r
+                    join release_scores s using(accession) where s.model = 'anthropic/claude-haiku-5.5'""")
+    if len(rel):
+        rel = rel[rel["ticker"].isin(tickers)].copy()
+        rel["tdate"] = assign_trading_date(pd.to_datetime(rel["accepted_at"]), dates, news_cut)
+        rel = rel.dropna(subset=["tdate"]).assign(gd=lambda d: d["g"].map({"up": 1.0, "down": -1.0}).fillna(0.0))
+        for name, col in (("rel_guide", "gd"), ("rel_tone", "t"), ("rel_result", "s"), ("rel_oneoff", "x")):
+            RAW[name] = _event_wide(rel, col, dates, tickers, "mean").ffill(limit=63)
 
     # ---- market-level features
     M: dict[str, pd.Series] = {}
@@ -383,6 +536,8 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
     out["raw_close"] = RC.values.ravel()[rows]
     out["atr_pct_raw"] = atr.values.ravel()[rows].astype(np.float32)
     out["dvol20"] = dvol20.values.ravel()[rows]
+    out["mcap"] = (MCAP.reindex(index=dates, columns=tickers).values.ravel()[rows] if MCAP is not None
+                   else np.full(len(rows), np.nan))
     sec_arr = np.asarray(sec_keys + ["unknown"], dtype=object)
     s_flat = sidx.ravel()[rows]
     out["sector"] = sec_arr[np.where(s_flat < 0, len(sec_keys), s_flat)]
@@ -392,6 +547,28 @@ def build_panel(con=None, save: bool = True) -> pd.DataFrame:
         out[name] = w.values.ravel()[rows].astype(np.float32)
     panel = pd.DataFrame(out)
     panel["sector"] = panel["sector"].astype("category")
+
+    # Earnings/fundamentals coverage is far thinner for names later removed from the index, so a NaN would tell the
+    # model which stocks eventually drop out. A constant fill would leave a spike a tree can isolate, and fresh random
+    # draws each day would jitter scores and churn the book, so each ticker/feature keeps one pseudo-random percentile
+    # and takes that percentile of the day's real values.
+    # Whether real financials were public that day. The all-stocks universe uses it to skip funds and blank-check shells.
+    panel["fund_known"] = panel["net_margin"].notna() | panel["rev_yoy"].notna() if "net_margin" in panel else False
+    for c in ("gp_assets", "asset_growth", "book_to_price", "earn_yield", "net_margin"):  # unfilled copies for factor scores
+        if c in panel:
+            panel[f"{c}_nf"] = panel[c]
+    fill = [c for c in EARN_FUND if c in panel]
+    codes, uniq = pd.factorize(panel["ticker"])
+    pct = {c: np.array([zlib.crc32(f"{t}|{c}".encode()) / 2**32 for t in uniq])[codes] for c in fill}
+    vals = {c: panel[c].to_numpy(copy=True) for c in fill}
+    for idx in panel.groupby("date", observed=True).indices.values():
+        for c in fill:
+            v = vals[c]
+            gaps, seen = idx[np.isnan(v[idx])], idx[~np.isnan(v[idx])]
+            if len(gaps) and len(seen):
+                v[gaps] = np.quantile(v[seen], pct[c][gaps], method="inverted_cdf")
+    for c in fill:
+        panel[c] = vals[c]
 
     feats = list(F) + list(RAW) + list(M)
     meta = {"features": feats, "ranked": list(F), "raw": list(RAW), "market": list(M),

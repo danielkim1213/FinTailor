@@ -49,6 +49,9 @@ SECTOR_RULES = [
 
 
 def lexicon_score(headline: str, summary: str = "", ticker: str | None = None) -> NewsScore:
+    # DataFrame rows give NaN for "no ticker"; NaN is truthy, which used to crash here and skip sector rules
+    ticker = ticker if isinstance(ticker, str) and ticker else None
+    summary = summary if isinstance(summary, str) else ""
     text = f"{headline} {summary[:300]}".lower()
     words = re.findall(r"[a-z]+", text)
     p, n = sum(w in POS for w in words), sum(w in NEG for w in words)

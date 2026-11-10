@@ -25,7 +25,9 @@ def tier_for(score: int) -> tuple[str, dict]:
 
 def fx_rates(con) -> dict[str, float]:
     out = {"USD": 1.0}
-    for cur, sids in (("KRW", ("YF_KRWX", "DEXKOUS")), ("CAD", ("YF_CADX", "DEXCAUS"))):
+    # USD-only: no client-currency conversion. Kept for when non-USD packs come back:
+    # ("KRW", ("YF_KRWX", "DEXKOUS")), ("CAD", ("YF_CADX", "DEXCAUS"))
+    for cur, sids in ():
         v = None
         for sid in sids:
             v = v or con.execute("select value from macro where series_id = ? order by date desc limit 1", [sid]).fetchone()
@@ -81,12 +83,13 @@ def candidates(con, run_date: pd.Timestamp, panel_rows: pd.DataFrame) -> pd.Data
 def _risks(row, lang: str) -> list[str]:
     r = []
     if row["earn_in_window"]:
-        r.append("earnings inside holding period" if lang == "en" else "보유 기간 중 실적 발표")
+    # KR disabled (English-first). Korean: 보유 기간 중 실적 발표 / 예정 일정 / 높은 변동성 / 장 마감 후 갭 위험
+        r.append("earnings inside holding period")
     if row["macro_events"]:
-        r.append(("scheduled events: " if lang == "en" else "예정 일정: ") + row["macro_events"])
+        r.append("scheduled events: " + row["macro_events"])
     if row["atr_pct_raw"] and row["atr_pct_raw"] > 0.04:
-        r.append("high volatility" if lang == "en" else "높은 변동성")
-    r.append("overnight gap risk" if lang == "en" else "장 마감 후 갭 위험")
+        r.append("high volatility")
+    r.append("overnight gap risk")
     return r
 
 
@@ -108,16 +111,18 @@ def build_for_customer(c: CustomerProfile, cand: pd.DataFrame, run_date: pd.Time
     if edu:
         msg = {"en": "No trade signals: we send education and market commentary until your profile is suitable "
                      "(emergency fund, no high-interest debt, some experience, risk score 5+).",
-               "ko": "현재 프로필에서는 매매 신호 대신 교육 자료와 시장 해설만 제공합니다 (비상금 확보, 고금리 부채 없음, "
-                     "투자 경험, 위험 점수 5 이상 필요)."}[lang]
+               # KR disabled: "ko": "현재 프로필에서는 매매 신호 대신 교육 자료와 시장 해설만 제공합니다 (비상금 확보, 고금리 부채 없음, "
+               #                    "투자 경험, 위험 점수 5 이상 필요)."
+               }[lang]
         return status_row("education", msg)
     limit = min(tier["weekly_loss_limit"], c.weekly_loss_limit_pct or 1.0)
     if state["weekly_pnl_pct"] <= -limit:
-        return status_row("blocked_loss_limit", {"en": "Weekly loss limit reached; no new signals this week.",
-                                                 "ko": "주간 손실 한도에 도달해 이번 주에는 새 신호를 보내지 않습니다."}[lang])
+        # KR disabled: "주간 손실 한도에 도달해 이번 주에는 새 신호를 보내지 않습니다."
+        return status_row("blocked_loss_limit", {"en": "Weekly loss limit reached; no new signals this week."}[lang])
     slots = tier["max_positions"] - state["open_positions"]
     if slots <= 0 or cand.empty:
-        return status_row("no_signal", {"en": "No new signals today.", "ko": "오늘은 새 신호가 없습니다."}[lang])
+        # KR disabled: "오늘은 새 신호가 없습니다."
+        return status_row("no_signal", {"en": "No new signals today."}[lang])
     d = cand[~cand["ticker"].isin(state["open_tickers"])]
     if not c.allow_short:
         d = d[d["direction"] == "long"]
@@ -128,8 +133,8 @@ def build_for_customer(c: CustomerProfile, cand: pd.DataFrame, run_date: pd.Time
         d = d[~d["earn_in_window"].fillna(False).astype(bool) & ~d["earn_unknown"].astype(bool)]
     d = d.head(slots)
     if d.empty:
-        return status_row("no_signal", {"en": "No signals passed your filters today.",
-                                        "ko": "오늘은 고객님 기준을 통과한 신호가 없습니다."}[lang])
+        # KR disabled: "오늘은 고객님 기준을 통과한 신호가 없습니다."
+        return status_row("no_signal", {"en": "No signals passed your filters today."}[lang])
     rate = fx[pack["currency"]]
     capital_usd = c.investable_amount / rate
     out = []

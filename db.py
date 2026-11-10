@@ -66,6 +66,11 @@ create table if not exists system_state(key varchar primary key, value varchar, 
 create table if not exists run_log(
   run_id varchar, step varchar, status varchar, detail varchar, started_at timestamp,
   finished_at timestamp);
+alter table fundamentals add column if not exists gp_ttm double;
+alter table fundamentals add column if not exists assets double;
+alter table fundamentals add column if not exists assets_yoy double;
+alter table fundamentals add column if not exists equity double;
+alter table fundamentals add column if not exists shares double;
 """
 
 

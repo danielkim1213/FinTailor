@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 
@@ -113,6 +115,100 @@ def _tiingo_download(tickers: list[str], start: str, end: str | None = None) -> 
 
 
 SOURCES = {"yfinance": _yf_download, "alpaca": _alpaca_download, "tiingo": _tiingo_download}
+
+
+def backfill_tiingo_paced(tickers: list[str] | None = None, start: str | None = None, per_hour: int = 45) -> dict:
+    """Fill tickers that have no prices (mostly delisted names yfinance dropped) from Tiingo's free tier:
+    50 requests/hour, 1,000/day, 500 unique symbols/month. Paced under the hourly cap, saves each ticker
+    as soon as it arrives, and remembers empty answers, so it can be stopped and re-run at any time."""
+    import json as _json
+
+    from ..db import get_state, set_state
+    tok = env("TIINGO_API_KEY")
+    if not tok:
+        raise RuntimeError("TIINGO_API_KEY not set")
+    cfg = get_config()
+    start = start or str(pd.Timestamp(cfg["universe"]["start_date"]) - pd.Timedelta(days=400))[:10]
+    with connect(read_only=True) as con:
+        if tickers is None:
+            tickers = [r[0] for r in con.execute(
+                "select distinct ticker from universe u where not exists "
+                "(select 1 from prices_daily p where p.ticker = u.ticker) order by 1").fetchall()]
+        empty = set(_json.loads(get_state(con, "tiingo_empty") or "[]"))
+    todo = [t for t in tickers if t not in empty]
+    gap = 3600.0 / per_hour
+    got, nodata, failed = 0, 0, []
+    log.info("tiingo paced: %d tickers to try (%d known empty), ~%.0f min", len(todo), len(empty), len(todo) * gap / 60)
+    for i, t in enumerate(todo):
+        t0 = time.monotonic()
+        while True:
+            try:
+                r = _session_get_tiingo(t, start, tok)
+            except Exception as e:  # noqa: BLE001
+                log.warning("tiingo %s: %s", t, e)
+                failed.append(t)
+                r = None
+                break
+            if r is not None and r.status_code == 429:
+                log.info("tiingo hourly cap hit at %s; sleeping 15 min", t)
+                time.sleep(900)
+                continue
+            break
+        rows = []
+        if r is not None and r.ok:
+            js = r.json()
+            rows = js if isinstance(js, list) else []
+        def save(write):  # another process may hold the DB (panel build, nightly): wait and retry
+            for attempt in range(10):
+                try:
+                    with connect() as con:
+                        return write(con)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("tiingo %s: DB busy (%s), retry in 30s", t, str(e)[:80])
+                    time.sleep(30)
+            failed.append(t)
+
+        if rows:
+            df = _tiingo_frame(t, rows)
+
+            def write(con, df=df):
+                d = _validity_filter(df, con)
+                if len(d):
+                    replace_where(con, "prices_daily", d, "ticker = ?", [t])
+                    return True
+                empty.add(t)
+                set_state(con, "tiingo_empty", _json.dumps(sorted(empty)))
+                return False
+            ok = save(write)
+            got += ok is True
+            nodata += ok is False
+        elif r is not None and r.ok:
+            nodata += 1
+            empty.add(t)
+            save(lambda con: set_state(con, "tiingo_empty", _json.dumps(sorted(empty))))
+        if i % 10 == 0:
+            log.info("tiingo paced: %d/%d (saved %d, empty %d, failed %d)", i + 1, len(todo), got, nodata, len(failed))
+        time.sleep(max(0.0, gap - (time.monotonic() - t0)))
+    out = {"saved": got, "empty_or_invalid": nodata, "failed": failed}
+    log.info("tiingo paced done: %s", out)
+    return out
+
+
+def _session_get_tiingo(t: str, start: str, tok: str):
+    import requests
+    return requests.get(f"https://api.tiingo.com/tiingo/daily/{t.replace('.', '-')}/prices",
+                        params={"startDate": start, "token": tok}, timeout=60)
+
+
+def _tiingo_frame(t: str, rows: list[dict]) -> pd.DataFrame:
+    d = pd.DataFrame(rows)
+    split_f = d.get("splitFactor", pd.Series(1.0, index=d.index)).replace(0, 1.0)
+    rev = split_f.iloc[::-1].cumprod().iloc[::-1] / split_f
+    return pd.DataFrame({
+        "ticker": t, "date": pd.to_datetime(d["date"]).dt.tz_localize(None).dt.date,
+        "open": d["open"] / rev, "high": d["high"] / rev, "low": d["low"] / rev, "close": d["close"] / rev,
+        "adj_close": d["adjClose"], "raw_close": d["close"], "volume": d["volume"] * rev, "vwap": np.nan,
+        "source": "tiingo"})
 
 
 def download(tickers: list[str], start: str, end: str | None = None, source: str | None = None) -> pd.DataFrame:

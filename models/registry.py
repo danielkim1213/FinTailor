@@ -52,7 +52,9 @@ class ModelBundle:
 def config_overrides(name: str) -> dict:
     if name in ("champion", "base"):
         return {}
-    for c in get_config().get("challengers", []):
+    cfg = get_config()
+    # ablations: backtest-only variants (never compete in the nightly gate)
+    for c in cfg.get("challengers", []) + cfg.get("ablations", []):
         if c["name"] == name:
             return {k: v for k, v in c.items() if k != "name"}
     raise KeyError(f"unknown model config {name}")

@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     bt.add_argument("--config", default="base")
     bt.add_argument("--horizons", type=int, nargs="*")
     bt.add_argument("--start")
+    bt.add_argument("--final", action="store_true", help="include the locked holdout period (do this once)")
     tr = sub.add_parser("train", help="train a model bundle on the latest data and make it champion")
     tr.add_argument("--config", default="base")
     tr.add_argument("--no-promote", action="store_true")
@@ -60,6 +61,12 @@ def main(argv: list[str] | None = None) -> int:
     rb.add_argument("--to")
     rs = sub.add_parser("resume", help="clear the kill switch after human review")
     rs.add_argument("--note", default="")
+    sv = sub.add_parser("strategy-validate", help="out-of-sample test of the strategy, with statistics that allow for the ideas tried")
+    sv.add_argument("--final", action="store_true", help="include the locked holdout (allowed once)")
+    sv.add_argument("--fresh-ml", action="store_true", help="retrain the walk-forward forecasts instead of using the cached ones")
+    sub.add_parser("strategy-today", help="experimental stock-level target weights (no validated edge; see README)")
+    at = sub.add_parser("alloc-today", help="what to hold next session: SPY, the strongest sectors, and how much exposure")
+    at.add_argument("--max-exposure", type=float, default=1.5, help="borrowing limit; 1.0 means never borrow")
     sub.add_parser("status", help="system status")
     sub.add_parser("dashboard", help="launch Streamlit dashboard")
     sub.add_parser("api", help="launch FastAPI server")
@@ -80,6 +87,31 @@ def main(argv: list[str] | None = None) -> int:
         for cst in SAMPLE_CUSTOMERS:
             save_customer(cst)
         print("initialized; sample customers:", [c.customer_id for c in SAMPLE_CUSTOMERS])
+    elif a.cmd == "strategy-validate":
+        from .strategy.engine import print_validation, validate
+        print_validation(validate(final=a.final, fresh_ml=a.fresh_ml))
+    elif a.cmd == "strategy-today":
+        from .strategy.engine import print_today, today
+        print_today(today())
+    elif a.cmd == "alloc-today":
+        import pandas as pd
+
+        from .db import connect
+        from .strategy.allocation import CORE, SECTOR_ETFS, Settings, current_allocation
+        names = "','".join([CORE, *SECTOR_ETFS])
+        with connect(read_only=True) as con:
+            px = con.execute(f"select ticker, date, adj_close from prices_daily where ticker in ('{names}')").df()
+        px["date"] = pd.to_datetime(px["date"])
+        close = px.pivot_table(index="date", columns="ticker", values="adj_close", aggfunc="last").sort_index().dropna(subset=[CORE])
+        r = current_allocation(close, Settings(max_exposure=a.max_exposure))
+        print(f"\nPrices through {r['as_of']}. Sectors held for {r['for_month']}: {', '.join(r['sectors'])}")
+        print(f"Recent volatility of the book: {r['recent_vol'] * 100:.1f}%/yr  ->  exposure {r['exposure'] * 100:.0f}% of capital")
+        print("\nTarget holdings (share of capital):")
+        for t, w in sorted(r["holdings"].items(), key=lambda kv: -kv[1]):
+            print(f"  {t:5s} {w * 100:6.1f}%")
+        cash = r["cash"]
+        print(f"  {'cash' if cash >= 0 else 'borrow':5s} {abs(cash) * 100:6.1f}%")
+        print("\nChange exposure only when it is more than 10 points from what you hold. Sectors change at the start of each month.")
     elif a.cmd == "demo":
         from .demo import run_demo
         _p(run_demo(a.stocks))
@@ -119,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "backtest":
         from .eval.backtest import run_backtest
         from .features.panel import load_panel
-        r = run_backtest(load_panel(), fast=a.fast, config_name=a.config, hs=a.horizons, start_test=a.start)
+        r = run_backtest(load_panel(), fast=a.fast, config_name=a.config, hs=a.horizons, start_test=a.start, final=a.final)
         for k, v in r.items():
             if isinstance(v, dict) and "gate" in v:
                 print(k, "gate:", v["gate"])

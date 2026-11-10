@@ -12,7 +12,8 @@ LIST_MARK = re.compile(r"^\s*\d+[.)]\s", re.M)
 BANNED = {
     "en": [r"guarantee", r"risk[- ]free", r"sure thing", r"can't lose", r"cannot lose", r"\bmargin\b", r"leverage",
            r"to the moon", r"\bcertain(ly)? (to|will)\b", r"no[- ]brainer", r"double your"],
-    "ko": [r"보장(?!하지\s*않)", r"확실", r"무조건", r"원금\s*보장", r"신용\s*매수", r"미수", r"레버리지", r"대박", r"100%\s*수익", r"손실\s*없"],
+    # KR disabled (English-first):
+    # "ko": [r"보장(?!하지\s*않)", r"확실", r"무조건", r"원금\s*보장", r"신용\s*매수", r"미수", r"레버리지", r"대박", r"100%\s*수익", r"손실\s*없"],
 }
 
 
